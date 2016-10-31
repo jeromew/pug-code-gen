@@ -76,7 +76,7 @@ function Compiler(node, options) {
   if (this.debug && this.inlineRuntimeFunctions) {
     this.runtimeFunctionsUsed.push('rethrow');
   }
-  this.balance = [];
+
   this.codeBuffer = '{';
   this.codeMarker = {};
   this.codeIndex = -1;
@@ -904,7 +904,28 @@ Compiler.prototype = {
         this.codeBuffer += "\n{" + "PUGMARKER"+this.codeIndex + "}\n";
         this.codeMarker["PUGMARKER"+this.codeIndex] = [];
         var savedAST = this.replaceAstBlock(this.codeMarker["PUGMARKER"+this.codeIndex]);
+
+        // snaphsot current unbuffered code level
+        // this is necessary to accept embedded code blocks
+        // - if (true) {
+        //   - var a = 1;
+        // - }
+        // but breaks the "should be reasonably fast" compile test
+        // note: we should add a test for this in pug
+        /*
+        var savedCodeBuffer = this.codeBuffer;
+        var savedCodeMarker = this.codeMarker;
+        var savedCodeIndex = this.codeIndex;
+        this.codeBuffer = '{';
+        this.codeMarker = {};
+        this.codeIndex = -1;
+        */
         this.visit(code.block, code);
+        /*
+        this.codeBuffer = savedCodeBuffer;
+        this.codeMarker = savedCodeMarker;
+        this.codeIndex = savedCodeIndex;
+        */
         this.replaceAstBlock(savedAST);
       }
 
