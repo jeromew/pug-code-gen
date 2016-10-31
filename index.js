@@ -8,7 +8,6 @@ var compileAttrs = require('pug-attrs');
 var selfClosing = require('void-elements');
 var constantinople = require('constantinople');
 var stringify = require('js-stringify');
-var addWith = require('with');
 
 var t = require('babel-types');
 var gen = require('babel-generator');
