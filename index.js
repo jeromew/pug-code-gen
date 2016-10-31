@@ -14,6 +14,7 @@ var t = require('babel-types');
 var gen = require('babel-generator');
 var babylon = require('babylon');
 var babelTemplate = require('babel-template');
+var babel = require('babel-core');
 
 // This is used to prevent pretty printing inside certain tags
 var WHITE_SPACE_SENSITIVE_TAGS = {
@@ -88,12 +89,12 @@ function Compiler(node, options) {
 
 Compiler.prototype = {
 
-  runtime: function (name) {
+  runtime: function (name, asAST) {
     if (this.inlineRuntimeFunctions) {
       this.runtimeFunctionsUsed.push(name);
-      return 'pug_' + name;
+      return asAST ? t.identifier('pug_' + name) : 'pug_' + name;
     } else {
-      return 'pug.' + name;
+      return asAST ? t.memberExpression(t.identifier('pug'), t.identifier(name)) : 'pug.' + name;
     }
   },
 
@@ -141,53 +142,82 @@ Compiler.prototype = {
       }
     }
 
-    //this.ast.push(t.emptyStatement())
-    //this.ast.push(t.returnStatement(t.identifier('pug_html')))
+    
+    var ast;
+    if (this.options.self) {
+      ast = [
+        t.variableDeclaration('var', [
+          t.variableDeclarator(t.identifier('self'), t.logicalExpression('||', t.identifier('locals'), t.objectExpression([])))
+        ])
+      ].concat(this.ast);
+    } else {
+      // addWith babel equivalent
+      var globals = this.options.globals ? this.options.globals.concat(INTERNAL_VARIABLES) : INTERNAL_VARIABLES;
+      globals.concat(this.runtimeFunctionsUsed.map(function (name) { return 'pug_' + name; }));
+      var tpl = "// @with exclude: "+ globals.join(",") +"\n{\nlocals || {};\nSOURCE;\n}"
+      var tplc = babelTemplate(tpl, { preserveComments: true });
+      ast = tplc({ SOURCE: this.ast })
+      ast.leadingComments = tplc().leadingComments;
+      ast = [ast];
+    }
+
+
+    if (this.debug) {
+      if (this.options.includeSources) {
+        ast.unshift(t.variableDeclaration('var', [
+          t.variableDeclarator(t.identifier('pug_debug_sources'), this.parseExpr(stringify(this.options.includeSources)))
+        ]))
+      }
+
+ 
+      var rethrowArgs = [
+                t.identifier('err'),
+                t.identifier('pug_debug_filename'),
+                t.identifier('pug_debug_line')
+              ]
+      if (this.options.includeSources) {
+          rethrowArgs.push(t.memberExpression(t.identifier('pug_debug_sources'), t.identifier('pug_debug_filename'), true))
+      } 
+      ast = [
+        t.variableDeclaration('var', [
+          t.variableDeclarator(t.identifier('pug_debug_filename'), null),
+          t.variableDeclarator(t.identifier('pug_debug_line'), null)
+        ]),
+        t.tryStatement(
+          t.blockStatement(ast),
+          t.catchClause(
+            t.identifier('err'),
+            t.blockStatement([t.expressionStatement(t.callExpression(
+              (this.inlineRuntimeFunctions ? t.identifier('pug_rethrow') : t.memberExpression(t.identifier('pug'), t.identifier('rethrow'))),
+              rethrowArgs
+            ))])
+          )
+        )
+      ]
+
+    }
+
     this.ast = t.functionDeclaration(
-      t.identifier(/*this.options.templateName || */'template'),
+      t.identifier(this.options.templateName || 'template'),
       [t.identifier('locals')],
       t.blockStatement([
-        /*t.variableDeclaration('var', [
+        t.variableDeclaration('var', [
           t.variableDeclarator(t.identifier('pug_html'), t.stringLiteral('')),
           t.variableDeclarator(t.identifier('pug_mixins'), t.objectExpression([])),
           t.variableDeclarator(t.identifier('pug_interp'), null)
-        ])*/].concat(this.ast))
+        ])].concat(ast, [t.emptyStatement(), t.returnStatement(t.identifier('pug_html'))]))
     )
 
 
-    var js = gen.default(this.ast, { /* options */ }).code;
-    js = js.substring("function template(locals) {".length, js.length-1)
+    var file = babylon.parse('');
+    file.program.body = [this.ast];
+    var w = babel.transformFromAst(file, null, {
+      code: false,
+      plugins: [ 'babel-plugin-transform-with' ]
+    });
 
-    var globals = this.options.globals ? this.options.globals.concat(INTERNAL_VARIABLES) : INTERNAL_VARIABLES;
-    if (this.options.self) {
-      js = 'var self = locals || {};' + js;
-    } else {
-      js = addWith('locals || {}', js, globals.concat(this.runtimeFunctionsUsed.map(function (name) { return 'pug_' + name; })));
-    }
-    if (this.debug) {
-      if (this.options.includeSources) {
-        js = 'var pug_debug_sources = ' + stringify(this.options.includeSources) + ';\n' + js;
-      }
-      js = 'var pug_debug_filename, pug_debug_line;' +
-        'try {' +
-        js +
-        '} catch (err) {' +
-        (this.inlineRuntimeFunctions ? 'pug_rethrow' : 'pug.rethrow') +
-        '(err, pug_debug_filename, pug_debug_line' +
-        (
-          this.options.includeSources
-          ? ', pug_debug_sources[pug_debug_filename]'
-          : ''
-        ) +
-        ');' +
-        '}';
-    }
 
-    //console.log(this.ast.body.body[2].expression.right)
-    //return buildRuntime(this.runtimeFunctionsUsed) + js;
-    // REMSTART
-    return buildRuntime(this.runtimeFunctionsUsed) + 'function ' + (this.options.templateName || 'template') + '(locals) {var pug_html = "", pug_mixins = {}, pug_interp;' + js + ';return pug_html;}';
-    // REMEND
+    return buildRuntime(this.runtimeFunctionsUsed) + gen.default(w.ast).code;
   },
 
   /**
@@ -334,7 +364,7 @@ Compiler.prototype = {
 
     if (debug && node.debug !== false && node.type !== 'Block') {
       if (node.line) {
-        this.ast.push(t.expressionStatement(t.assignmentExpression('=', t.identifier('pug_debug_line'), t.identifier(node.line))))
+        this.ast.push(t.expressionStatement(t.assignmentExpression('=', t.identifier('pug_debug_line'), t.numericLiteral(node.line))))
         if (node.filename) {
           this.ast.push(t.expressionStatement(t.assignmentExpression('=', t.identifier('pug_debug_filename'), t.stringLiteral(node.filename))))
         }
@@ -589,7 +619,7 @@ Compiler.prototype = {
             astKey.push(t.objectProperty(
               t.identifier('attributes'),
               t.callExpression(
-                t.identifier(this.runtime('merge')),
+                this.runtime('merge', true),
                 attrsBlocks.map(function(b) { return self.parseExpr(b) })
               )
             ));
@@ -633,7 +663,7 @@ Compiler.prototype = {
       if (args.length && /^\.\.\./.test(args[args.length - 1].trim())) {
         rest = args.pop().trim().replace(/^\.\.\./, '');
       }
-      var astArgs = args.map(function(arg) { return t.identifier(arg)})
+      var astArgs = args.map(function(arg) { return t.identifier(arg.trim())})
       // we need use pug_interp here for v8: https://code.google.com/p/v8/issues/detail?id=4165
       // once fixed, use this: this.buf.push(name + ' = function(' + args.join(',') + '){');
       var astMixin = [];
@@ -681,7 +711,7 @@ Compiler.prototype = {
         )
         astMixin.push(
           t.forStatement(
-            t.assignmentExpression('=', t.identifier('pug_interp'), t.identifier(args.length)),
+            t.assignmentExpression('=', t.identifier('pug_interp'), t.numericLiteral(args.length)),
             t.binaryExpression('<', t.identifier('pug_interp'), t.memberExpression(t.identifier('arguments'), t.identifier('length'))),
             t.updateExpression('++', t.identifier('pug_interp'), false),
             t.expressionStatement(
@@ -872,7 +902,7 @@ Compiler.prototype = {
 
       if (code.block) {
         this.codeIndex++;
-        this.codeBuffer += "{" + "PUGMARKER"+this.codeIndex + "}";
+        this.codeBuffer += "\n{" + "PUGMARKER"+this.codeIndex + "}\n";
         this.codeMarker["PUGMARKER"+this.codeIndex] = [];
         var savedAST = this.replaceAstBlock(this.codeMarker["PUGMARKER"+this.codeIndex]);
         this.visit(code.block, code);
@@ -889,7 +919,8 @@ Compiler.prototype = {
           this.codeIndex = -1;
           this.codeMarker = {};
         } catch(e) {
-          //console.log('MISSED', this.codeBuffer+'}')
+          var codeError = this.codeBuffer.substr(1).trim()
+          this.error('Unbuffered code structure could not be parsed; ' + e.message + ' in ' + codeError, codeError, code)
         }
       }
 
@@ -995,7 +1026,7 @@ Compiler.prototype = {
       var arrayLoop = 
           t.blockStatement([t.forStatement(
             t.variableDeclaration('var', [
-              t.variableDeclarator(t.identifier(indexVarName), t.identifier(0)),
+              t.variableDeclarator(t.identifier(indexVarName), t.numericLiteral(0)),
               t.variableDeclarator(t.identifier('$$l'), t.memberExpression(t.identifier('$$obj'), t.identifier('length')))
             ]),
             t.binaryExpression('<', t.identifier(indexVarName), t.identifier('$$l')),
@@ -1014,7 +1045,7 @@ Compiler.prototype = {
 
       var objectLoop = t.blockStatement([
         t.variableDeclaration('var', [
-          t.variableDeclarator(t.identifier('$$l'), t.identifier(0))
+          t.variableDeclarator(t.identifier('$$l'), t.numericLiteral(0))
         ]),
         t.forInStatement(
           t.variableDeclaration('var', [
@@ -1045,7 +1076,7 @@ Compiler.prototype = {
 
     if (each.alternate) {
       objectLoop.body.push(t.ifStatement(
-            t.binaryExpression('===', t.identifier('$$l'), t.identifier(0)),
+            t.binaryExpression('===', t.identifier('$$l'), t.numericLiteral(0)),
             t.blockStatement(blockObjAlt)
       ))
       this.replaceAstBlock(blockObjAlt);
